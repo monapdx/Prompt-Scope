@@ -77,7 +77,7 @@ Browse your conversations with:
 
 Powered by deterministic logic (no external APIs)
 
-<img src="https://raw.githubusercontent.com/monapdx/Prompt-Scope/refs/heads/main/patterns.png">
+
 
 ---
 
@@ -96,7 +96,7 @@ Includes:
 * Speaker filtering (user vs assistant)
 * Token cleaning
 
-→ see 
+<img src="https://raw.githubusercontent.com/monapdx/Prompt-Scope/refs/heads/main/patterns.png">
 
 ---
 
