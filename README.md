@@ -76,7 +76,8 @@ Browse your conversations with:
 * Global summaries of your usage
 
 Powered by deterministic logic (no external APIs)
-→ see 
+
+<img src="https://raw.githubusercontent.com/monapdx/Prompt-Scope/refs/heads/main/patterns.png">
 
 ---
 
