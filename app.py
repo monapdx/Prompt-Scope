@@ -179,7 +179,7 @@ def extract_messages_from_chat_content(chat: dict) -> list[dict]:
     """
     cid = chat.get("id") or chat.get("conversation_id") or ""
     title = chat.get("title") or "(untitled)"
-    created_at = chat.get("created_at")
+    parent_created_at = chat.get("created_at")
     raw_content = chat.get("content") or ""
 
     rows: List[Dict[str, Any]] = []
@@ -206,18 +206,18 @@ def extract_messages_from_chat_content(chat: dict) -> list[dict]:
                 return parent_ts
         return v
 
-    def add_row(role: str, text: str, ts: Any = None, msg_id: str | None = None):
+    def add_row(role: str, text: str, message_created_at: Any = None, msg_id: str | None = None):
         text = (text or "").strip()
         if not text:
             return
         role_n = _normalize_role(role)
-        ts_val = _coerce_row_timestamp(ts, created_at)
+        final_created_at = _coerce_row_timestamp(message_created_at, parent_created_at)
         rows.append(
             {
                 "conversation_id": cid,
                 "conversation_title": title,
                 "author_role": role_n,
-                "created_at": ts_val,
+                "created_at": final_created_at,
                 "text_raw": text,
                 "text": _clean_text_for_token_analysis(text),
                 "word_count": len(text.split()),
@@ -230,7 +230,8 @@ def extract_messages_from_chat_content(chat: dict) -> list[dict]:
     transcript_parts = _split_transcript_with_role_markers(str(raw_content))
     if transcript_parts:
         for idx, p in enumerate(transcript_parts):
-            add_row(p.get("author_role") or "unknown", p.get("text") or "", created_at, msg_id=f"{cid}:{idx}")
+            # Transcript-style rows have no per-message timestamps: always use parent chat created_at.
+            add_row(p.get("author_role") or "unknown", p.get("text") or "", None, msg_id=f"{cid}:{idx}")
         # If we got real roles, return immediately.
         if any(r["author_role"] in ("user", "assistant", "system", "tool") for r in rows):
             return rows
@@ -265,8 +266,8 @@ def extract_messages_from_chat_content(chat: dict) -> list[dict]:
                     if not text:
                         continue
                     role = _extract_author_role(message, node)
-                    ts = message.get("create_time") or message.get("created_at") or created_at
-                    add_row(role, text, ts, msg_id=message.get("id") or node_id)
+                    message_created_at = message.get("create_time") or message.get("created_at")
+                    add_row(role, text, message_created_at, msg_id=message.get("id") or node_id)
                 if rows:
                     return rows
 
@@ -281,17 +282,17 @@ def extract_messages_from_chat_content(chat: dict) -> list[dict]:
                             if isinstance(text, (dict, list)):
                                 # ChatGPT export message objects
                                 text = _extract_message_text(m)
-                            ts = m.get("create_time") or m.get("created_at") or created_at
-                            add_row(role, str(text), ts, msg_id=str(m.get("id") or f"{cid}:{idx}"))
+                            message_created_at = m.get("create_time") or m.get("created_at")
+                            add_row(role, str(text), message_created_at, msg_id=str(m.get("id") or f"{cid}:{idx}"))
                         else:
-                            add_row("unknown", str(m), created_at, msg_id=f"{cid}:{idx}")
+                            add_row("unknown", str(m), None, msg_id=f"{cid}:{idx}")
                     if rows:
                         return rows
 
     # 3) Final fallback: do not treat entire conversation as one message unless we have no structure.
     text_fallback = s if isinstance(raw_content, str) else str(raw_content)
     if text_fallback.strip():
-        add_row("unknown", text_fallback.strip(), created_at, msg_id=f"{cid}:fallback")
+        add_row("unknown", text_fallback.strip(), None, msg_id=f"{cid}:fallback")
     return rows
 
 # ---------- DB LAYER ----------
@@ -481,6 +482,78 @@ def list_chats_with_content(
                 "content_analysis": row[5] or "",
                 "content_preview": row[6] or "",
                 "content_len": int(row[7] or 0),
+            }
+        )
+    return result
+
+
+def list_chats_with_full_content(
+    search: str = "",
+    category_ids: Optional[List[int]] = None,
+    sort: str = "newest",
+):
+    """
+    Bulk query that returns full chat content (no truncation).
+    Use this only for workflows that require full parsing (e.g. message-level Patterns).
+    """
+    conn = get_conn()
+    q = """
+        SELECT
+            c.id,
+            c.title,
+            c.created_at,
+            c.model,
+            COALESCE(GROUP_CONCAT(cat.name, ', '), '') as categories,
+            COALESCE(c.content, '') as content,
+            LENGTH(COALESCE(c.content, '')) as content_len
+        FROM chats c
+        LEFT JOIN chat_categories cc ON c.id = cc.chat_id
+        LEFT JOIN categories cat ON cc.category_id = cat.id
+    """
+    params: List[Any] = []
+    where: List[str] = []
+    if search:
+        where.append("(LOWER(c.title) LIKE ? OR LOWER(c.content) LIKE ?)")
+        s = f"%{search.lower()}%"
+        params.extend([s, s])
+    if category_ids:
+        placeholders = ",".join("?" * len(category_ids))
+        q += f"""
+            JOIN (
+                SELECT chat_id
+                FROM chat_categories
+                WHERE category_id IN ({placeholders})
+                GROUP BY chat_id
+                HAVING COUNT(DISTINCT category_id) = {len(category_ids)}
+            ) AS must ON must.chat_id = c.id
+        """
+        params.extend(category_ids)
+
+    if where:
+        q += " WHERE " + " AND ".join(where)
+
+    q += " GROUP BY c.id "
+
+    if sort == "newest":
+        q += " ORDER BY datetime(c.created_at) DESC NULLS LAST, c.title COLLATE NOCASE ASC"
+    elif sort == "oldest":
+        q += " ORDER BY datetime(c.created_at) ASC NULLS LAST, c.title COLLATE NOCASE ASC"
+    else:
+        q += " ORDER BY c.title COLLATE NOCASE ASC"
+
+    rows = conn.execute(q, params).fetchall()
+    conn.close()
+    result = []
+    for row in rows:
+        result.append(
+            {
+                "id": row[0],
+                "title": row[1],
+                "created_at": row[2],
+                "model": row[3],
+                "categories": row[4],
+                "content": row[5] or "",
+                "content_len": int(row[6] or 0),
             }
         )
     return result
@@ -908,28 +981,27 @@ def main(go_home: Callable[[], None] | None = None):
 
         if st.button("Run patterns on current filter", key="run_patterns_btn"):
             # Fetch from SQLite (source of truth), then expand each chat into message rows.
-            chats_full = list_chats_with_content(
+            chats_full = list_chats_with_full_content(
                 search=search,
                 category_ids=cat_filter_ids,
                 sort={"newest": "newest", "oldest": "oldest", "title A→Z": "title"}[sort],
-                analysis_chars=MAX_ANALYSIS_CHARS,
-                preview_chars=MAX_PREVIEW_CHARS,
             )
+            st.session_state._patterns_chats_sample = chats_full
             rows: List[Dict[str, Any]] = []
             for c in chats_full:
                 chat_obj = {
                     "id": c.get("id"),
                     "title": c.get("title"),
                     "created_at": c.get("created_at"),
-                    # Use analysis text (bounded) for parsing; preview/full is loaded only on demand elsewhere.
-                    "content": c.get("content_analysis") or "",
+                    # Use full stored content for message parsing.
+                    "content": c.get("content") or "",
                 }
                 rows.extend(extract_messages_from_chat_content(chat_obj))
 
             msg_df = pd.DataFrame(rows)
             if not msg_df.empty:
                 # Normalize timestamps if possible.
-                msg_df["created_at"] = pd.to_datetime(msg_df.get("created_at"), errors="coerce")
+                msg_df["created_at"] = pd.to_datetime(msg_df["created_at"], errors="coerce", utc=True)
                 msg_df["source_file"] = "SQLite"
             st.session_state._patterns_msg_df = msg_df
             st.session_state._patterns_filter = {"speaker_filter": speaker_filter, "min_len": min_len}
@@ -1029,6 +1101,29 @@ def main(go_home: Callable[[], None] | None = None):
                 months_df = analysis["months"]
                 if months_df.empty:
                     st.info("No timestamps were available.")
+                    # Timestamp diagnostics to quickly confirm parsing vs. chat-level dates.
+                    st.write(
+                        {
+                            "total_parsed_rows": int(len(msg_df)),
+                            "rows_with_valid_created_at": int(msg_df["created_at"].notna().sum())
+                            if "created_at" in msg_df
+                            else 0,
+                            "rows_missing_created_at": int(msg_df["created_at"].isna().sum())
+                            if "created_at" in msg_df
+                            else 0,
+                        }
+                    )
+                    chats_sample = st.session_state.get("_patterns_chats_sample") or []
+                    if chats_sample:
+                        st.write("Chat-level created_at sample")
+                        st.dataframe(pd.DataFrame(chats_sample)[["title", "created_at"]].head(10), use_container_width=True)
+                    st.write("Parsed message created_at sample")
+                    if not msg_df.empty and "created_at" in msg_df:
+                        st.dataframe(
+                            msg_df[["conversation_title", "author_role", "created_at"]].head(20),
+                            use_container_width=True,
+                            height=360,
+                        )
                 else:
                     st.line_chart(months_df.set_index("month"))
                     st.dataframe(months_df, use_container_width=True)
@@ -1057,6 +1152,20 @@ def main(go_home: Callable[[], None] | None = None):
                 st.write({"author_role_counts": msg_df["author_role"].value_counts(dropna=False).to_dict()})
                 fallback_unknown = int((msg_df["author_role"] == "unknown").sum())
                 st.write({"fallback_unknown_rows": fallback_unknown})
+                chats_sample = st.session_state.get("_patterns_chats_sample") or []
+                if chats_sample:
+                    st.write("Chat-level created_at sample")
+                    st.dataframe(pd.DataFrame(chats_sample)[["title", "created_at"]].head(10), use_container_width=True)
+
+                st.write("Parsed message timestamp sample")
+                st.dataframe(
+                    msg_df[["conversation_title", "author_role", "created_at"]].head(20),
+                    use_container_width=True,
+                    height=360,
+                )
+
+                st.write("Valid parsed timestamps:", int(msg_df["created_at"].notna().sum()) if "created_at" in msg_df else 0)
+                st.write("Missing parsed timestamps:", int(msg_df["created_at"].isna().sum()) if "created_at" in msg_df else 0)
                 total_rows = int(len(msg_df))
                 valid_ts = (
                     int(pd.to_datetime(msg_df["created_at"], errors="coerce").notna().sum())
