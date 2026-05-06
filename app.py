@@ -24,7 +24,7 @@ if str(PROJECT_ROOT) not in sys.path:
 if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
 
-from conversation_insights import analyze_chat, find_similar_conversations, generate_global_insights, guess_topics
+from conversation_insights import analyze_chat, generate_global_insights, guess_topics
 from chat_patterns import analyze_message_patterns, messages_from_stored_chats, parse_mapping_export_bytes
 
 # Store the DB alongside this app file (local-first, predictable).
@@ -427,7 +427,7 @@ def _tag_badge(name: str):
     )
 
 
-def _chat_row(chat: Dict[str, Any], key_prefix: str, analyzed_pool: List[Dict[str, Any]]):
+def _chat_row(chat: Dict[str, Any], key_prefix: str):
     cols = st.columns([0.06, 0.44, 0.22, 0.28])
     with cols[0]:
         checked = st.checkbox("", key=f"{key_prefix}_{chat['id']}")
@@ -444,34 +444,17 @@ def _chat_row(chat: Dict[str, Any], key_prefix: str, analyzed_pool: List[Dict[st
         else:
             st.caption("—")
     with cols[3]:
-        with st.expander("Preview"):
-            st.text_area(
-                "Content",
-                (chat.get("content_preview") or ""),
-                height=160,
-                label_visibility="collapsed",
-            )
-            if chat.get("content_len", 0) > len(chat.get("content_preview") or ""):
-                st.caption(f"Preview truncated ({len(chat.get('content_preview') or ''):,} / {chat.get('content_len', 0):,} chars).")
-            # Similar conversations are expensive: compute only when preview is opened.
-            similars = _cached_similar_conversations(
-                chat_id=chat["id"],
-                title=chat.get("title") or "",
-                created_at=chat.get("created_at"),
-                model=chat.get("model") or "",
-                content_analysis=chat.get("content_analysis") or "",
-                analyzed_pool=analyzed_pool,
-            )
-            if similars:
-                st.markdown("#### You’ve explored this before")
-                for s in similars:
-                    st.markdown(f"**{s['title']}**")
-                    if s.get("created_at"):
-                        st.caption(s["created_at"])
-                    if s.get("overlap_topics"):
-                        st.write("Overlapping topics: " + ", ".join(s["overlap_topics"]))
-                    if s.get("overlap_keywords"):
-                        st.write("Overlapping keywords: " + ", ".join([f"`{k}`" for k in s["overlap_keywords"]]))
+        preview_key = f"preview_btn_{key_prefix}_{chat['id']}"
+        if st.button("Preview", key=preview_key, use_container_width=True):
+            st.session_state.preview_chat_id = chat["id"] if st.session_state.get("preview_chat_id") != chat["id"] else None
+
+        if st.session_state.get("preview_chat_id") == chat["id"]:
+            details = get_chat(chat["id"])
+            content = (details.get("content") if details else "") or ""
+            shown = content[:MAX_PREVIEW_CHARS]
+            st.text_area("Content", shown, height=160, label_visibility="collapsed")
+            if len(content) > len(shown):
+                st.caption(f"Preview truncated ({len(shown):,} / {len(content):,} chars).")
     return checked
 
 
@@ -480,57 +463,6 @@ def _cached_analyze_chat(chat_id: str, title: str, created_at: Optional[str], mo
     # Deterministic per-chat analysis (content already truncated upstream).
     details = {"id": chat_id, "title": title, "created_at": created_at, "model": model, "content": content_analysis}
     return analyze_chat(details)
-
-
-def _pool_signature(analyzed_pool: List[Dict[str, Any]]) -> str:
-    # Keep signature stable but cheap: ids + topics/keywords only.
-    minimal = []
-    for a in analyzed_pool:
-        minimal.append(
-            {
-                "id": a.get("id"),
-                "topics": a.get("topics") or [],
-                "keywords": a.get("keywords") or [],
-            }
-        )
-    payload = json.dumps(minimal, ensure_ascii=False, sort_keys=True)
-    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
-
-
-@st.cache_data(show_spinner=False)
-def _cached_similars(chat_id: str, pool_sig: str, target: Dict[str, Any], pool_minimal: List[Dict[str, Any]]):
-    # Cache per chat + pool signature (pool changes with search/filter).
-    _ = pool_sig
-    return find_similar_conversations(target, pool_minimal, top_k=3)
-
-
-def _cached_similar_conversations(
-    *,
-    chat_id: str,
-    title: str,
-    created_at: Optional[str],
-    model: str,
-    content_analysis: str,
-    analyzed_pool: List[Dict[str, Any]],
-):
-    target = _cached_analyze_chat(chat_id, title, created_at, model, content_analysis)
-    target = dict(target)
-    target["id"] = chat_id
-    target["title"] = title
-    target["created_at"] = created_at
-    pool_sig = _pool_signature(analyzed_pool)
-    pool_min = []
-    for a in analyzed_pool:
-        pool_min.append(
-            {
-                "id": a.get("id"),
-                "title": a.get("title"),
-                "created_at": a.get("created_at"),
-                "topics": a.get("topics") or [],
-                "keywords": a.get("keywords") or [],
-            }
-        )
-    return _cached_similars(chat_id, pool_sig, target, pool_min)
 
 
 @st.cache_data(show_spinner=False)
@@ -621,7 +553,8 @@ def main(go_home: Callable[[], None] | None = None):
             help="How many conversations to show per page.",
         )
 
-    chats = list_chats_with_content(
+    # Lightweight list view: do NOT pull full content unless needed (preview/explicit analysis).
+    chats = list_chats(
         search=search,
         category_ids=cat_filter_ids,
         sort={"newest": "newest", "oldest": "oldest", "title A→Z": "title"}[sort],
@@ -633,41 +566,54 @@ def main(go_home: Callable[[], None] | None = None):
             "(e.g. `conversations.json`). Imported chats will persist locally and be available next time."
         )
 
-    t0 = time.perf_counter()
-    analyzed: List[Dict[str, Any]] = []
+    # IMPORTANT: Do not run heavy analysis during normal list interactions
+    # (e.g. checkbox selection). Analysis is behind explicit buttons below.
+    analysis_s = 0.0
     analyzed_n = 0
-    for c in chats:
-        analyzed_n += 1
-        row = _cached_analyze_chat(
-            c["id"],
-            c.get("title") or "",
-            c.get("created_at"),
-            c.get("model") or "",
-            c.get("content_analysis") or "",
-        )
-        row = dict(row)
-        row["id"] = c.get("id")
-        row["title"] = c.get("title")
-        row["created_at"] = c.get("created_at")
-        analyzed.append(row)
-    analysis_s = time.perf_counter() - t0
 
     tab_insights, tab_patterns = st.tabs(["Insights", "Patterns"])
 
     with tab_insights:
         st.subheader("Insights")
-        # Deterministic + potentially expensive; cache.
-        insights = _cached_global_insights(analyzed)
-        for insight in insights:
-            desc = insight.get("description") or ""
-            n_lines = desc.count("\n") + 1 if desc else 0
-            is_long = (len(desc) > 500) or (n_lines > 10)
-            if is_long:
-                with st.expander(insight["title"], expanded=False):
+        if st.button("Run insights on current filter", key="run_insights_btn"):
+            t0 = time.perf_counter()
+            chats_full = list_chats_with_content(
+                search=search,
+                category_ids=cat_filter_ids,
+                sort={"newest": "newest", "oldest": "oldest", "title A→Z": "title"}[sort],
+            )
+            analyzed: List[Dict[str, Any]] = []
+            for c in chats_full:
+                row = _cached_analyze_chat(
+                    c["id"],
+                    c.get("title") or "",
+                    c.get("created_at"),
+                    c.get("model") or "",
+                    c.get("content_analysis") or "",
+                )
+                row = dict(row)
+                row["id"] = c.get("id")
+                row["title"] = c.get("title")
+                row["created_at"] = c.get("created_at")
+                analyzed.append(row)
+            st.session_state._last_insights_analyzed_n = len(analyzed)
+            st.session_state._last_insights_seconds = time.perf_counter() - t0
+            st.session_state._last_insights = _cached_global_insights(analyzed)
+
+        insights = st.session_state.get("_last_insights") or []
+        if not insights:
+            st.caption("Click **Run insights on current filter** to compute insights. This keeps chat selection fast.")
+        else:
+            for insight in insights:
+                desc = insight.get("description") or ""
+                n_lines = desc.count("\n") + 1 if desc else 0
+                is_long = (len(desc) > 500) or (n_lines > 10)
+                if is_long:
+                    with st.expander(insight["title"], expanded=False):
+                        st.write(desc)
+                else:
+                    st.markdown(f"### {insight['title']}")
                     st.write(desc)
-            else:
-                st.markdown(f"### {insight['title']}")
-                st.write(desc)
 
     with tab_patterns:
         st.subheader("Patterns")
@@ -691,21 +637,32 @@ def main(go_home: Callable[[], None] | None = None):
         with p3:
             msg_search = st.text_input("Search messages", key="patterns_search_messages")
 
-        # Build message-level rows from the currently loaded chat set (filtered by search/category).
-        # Use the already-loaded (truncated) chat content instead of re-querying per chat.
-        msg_df = messages_from_stored_chats(
-            [
-                {
-                    "id": c.get("id"),
-                    "title": c.get("title"),
-                    "created_at": c.get("created_at"),
-                    "model": c.get("model"),
-                    "content": c.get("content_analysis") or "",
-                }
-                for c in chats
-            ],
-            source_name="SQLite",
-        )
+        if st.button("Run patterns on current filter", key="run_patterns_btn"):
+            chats_full = list_chats_with_content(
+                search=search,
+                category_ids=cat_filter_ids,
+                sort={"newest": "newest", "oldest": "oldest", "title A→Z": "title"}[sort],
+            )
+            msg_df = messages_from_stored_chats(
+                [
+                    {
+                        "id": c.get("id"),
+                        "title": c.get("title"),
+                        "created_at": c.get("created_at"),
+                        "model": c.get("model"),
+                        "content": c.get("content_analysis") or "",
+                    }
+                    for c in chats_full
+                ],
+                source_name="SQLite",
+            )
+            st.session_state._patterns_msg_df = msg_df
+            st.session_state._patterns_filter = {"speaker_filter": speaker_filter, "min_len": min_len}
+
+        msg_df = st.session_state.get("_patterns_msg_df")
+        if msg_df is None:
+            st.caption("Click **Run patterns on current filter** to compute message-level patterns.")
+            msg_df = pd.DataFrame()
 
         # Optional fallback: allow ad-hoc raw export analysis without affecting DB.
         with st.expander("Optional: analyze raw `conversations.json` mapping exports (not imported)"):
@@ -842,27 +799,31 @@ def main(go_home: Callable[[], None] | None = None):
 
     selected_ids = []
     for idx, chat in enumerate(visible):
-        if _chat_row(chat, key_prefix=f"row{start+idx}", analyzed_pool=analyzed):
+        if _chat_row(chat, key_prefix=f"row{start+idx}"):
             selected_ids.append(chat["id"])
 
     st.markdown("---")
     st.markdown("### Categorize Selected")
 
     if selected_ids:
-        combined_parts: List[str] = []
-        for ch in get_chats(selected_ids):
-            combined_parts.append(f"{ch.get('title') or ''}\n{(ch.get('content') or '')[:MAX_ANALYSIS_CHARS]}")
-        combined_text = "\n\n".join(combined_parts)
-        # Deterministic but can be expensive; cache by content (already bounded by selected + truncation).
-        suggested, _scores = _cached_guess_topics(combined_text[:MAX_ANALYSIS_CHARS])
-        if suggested:
+        if st.button("Suggest tags for selected", key="suggest_tags_btn"):
+            combined_parts: List[str] = []
+            for ch in get_chats(selected_ids):
+                combined_parts.append(f"{ch.get('title') or ''}\n{(ch.get('content') or '')[:MAX_ANALYSIS_CHARS]}")
+            combined_text = "\n\n".join(combined_parts)[:MAX_ANALYSIS_CHARS]
+            suggested, _scores = _cached_guess_topics(combined_text)
+            st.session_state.prompt_scope_suggested_options = suggested or []
+            st.session_state.prompt_scope_suggested_selected = []
+
+        suggested_opts = st.session_state.get("prompt_scope_suggested_options") or []
+        if suggested_opts:
             st.markdown("### Suggested tags")
-            st.caption("Based on the selected chats’ topics (deterministic rules).")
+            st.caption("Suggestions only. Nothing is created/applied unless you explicitly assign it.")
             st.multiselect(
-                "Suggested tags",
-                options=suggested,
-                default=suggested,
-                key="prompt_scope_suggested_tags",
+                "Choose suggested tags to apply",
+                options=suggested_opts,
+                default=st.session_state.get("prompt_scope_suggested_selected") or [],
+                key="prompt_scope_suggested_selected",
             )
 
     cat_left, cat_right = st.columns([0.6, 0.4])
@@ -875,8 +836,8 @@ def main(go_home: Callable[[], None] | None = None):
             if new_cat.strip():
                 names.append(new_cat.strip())
             names += assign_existing
-            suggested_selected = st.session_state.get("prompt_scope_suggested_tags") or []
-            names += list(suggested_selected)
+            # Suggested tags are ONLY applied if user explicitly selected them above.
+            names += list(st.session_state.get("prompt_scope_suggested_selected") or [])
             names = [n.strip() for n in names if n and n.strip()]
             names = list(dict.fromkeys(names))  # stable de-dupe
             assign_categories(selected_ids, names)
