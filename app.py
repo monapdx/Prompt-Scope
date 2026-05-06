@@ -1,10 +1,11 @@
-# apps/inboxGPT_app.py
+# apps/prompt_scope_app.py
 from __future__ import annotations
 
 import hashlib
 import json
 import sqlite3
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -14,17 +15,24 @@ import streamlit as st
 
 # NOTE: Do NOT call st.set_page_config() here (suite_home owns it)
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-_APP_DIR = Path(__file__).resolve().parent
+APP_DIR = Path(__file__).resolve().parent
+# Avoid Path(__file__).resolve().parents[1] unless the package layout truly requires it.
+# Most local runs expect imports to work relative to the app directory and its parent.
+PROJECT_ROOT = APP_DIR.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
-if str(_APP_DIR) not in sys.path:
-    sys.path.insert(0, str(_APP_DIR))
+if str(APP_DIR) not in sys.path:
+    sys.path.insert(0, str(APP_DIR))
 
 from conversation_insights import analyze_chat, find_similar_conversations, generate_global_insights, guess_topics
 from chat_patterns import analyze_message_patterns, messages_from_stored_chats, parse_mapping_export_bytes
 
-DB_PATH = str((PROJECT_ROOT / "chat_categorizer.db").resolve())
+# Store the DB alongside this app file (local-first, predictable).
+DB_PATH = str((APP_DIR / "promptscope.db").resolve())
+
+# ---------- PERF LIMITS ----------
+MAX_ANALYSIS_CHARS = 20_000
+MAX_PREVIEW_CHARS = 4_000
 
 # ---------- DB LAYER ----------
 
@@ -61,6 +69,15 @@ def init_db():
     )
     conn.commit()
     conn.close()
+
+
+def count_chats() -> int:
+    conn = get_conn()
+    try:
+        row = conn.execute("SELECT COUNT(*) FROM chats").fetchone()
+        return int(row[0] if row and row[0] is not None else 0)
+    finally:
+        conn.close()
 
 
 def upsert_chat(chat: Dict[str, Any]):
@@ -131,6 +148,84 @@ def list_chats(search: str = "", category_ids: Optional[List[int]] = None, sort:
     return result
 
 
+def list_chats_with_content(
+    search: str = "",
+    category_ids: Optional[List[int]] = None,
+    sort: str = "newest",
+    *,
+    analysis_chars: int = MAX_ANALYSIS_CHARS,
+    preview_chars: int = MAX_PREVIEW_CHARS,
+):
+    """
+    Bulk query that returns everything the UI/analysis needs in one pass.
+    We intentionally truncate content for performance (analysis + preview),
+    because Streamlit reruns the script on every interaction.
+    """
+    conn = get_conn()
+    q = """
+        SELECT
+            c.id,
+            c.title,
+            c.created_at,
+            c.model,
+            COALESCE(GROUP_CONCAT(cat.name, ', '), '') as categories,
+            SUBSTR(COALESCE(c.content, ''), 1, ?) as content_analysis,
+            SUBSTR(COALESCE(c.content, ''), 1, ?) as content_preview,
+            LENGTH(COALESCE(c.content, '')) as content_len
+        FROM chats c
+        LEFT JOIN chat_categories cc ON c.id = cc.chat_id
+        LEFT JOIN categories cat ON cc.category_id = cat.id
+    """
+    params: List[Any] = [int(analysis_chars), int(preview_chars)]
+    where: List[str] = []
+    if search:
+        where.append("(LOWER(c.title) LIKE ? OR LOWER(c.content) LIKE ?)")
+        s = f"%{search.lower()}%"
+        params.extend([s, s])
+    if category_ids:
+        placeholders = ",".join("?" * len(category_ids))
+        q += f"""
+            JOIN (
+                SELECT chat_id
+                FROM chat_categories
+                WHERE category_id IN ({placeholders})
+                GROUP BY chat_id
+                HAVING COUNT(DISTINCT category_id) = {len(category_ids)}
+            ) AS must ON must.chat_id = c.id
+        """
+        params.extend(category_ids)
+
+    if where:
+        q += " WHERE " + " AND ".join(where)
+
+    q += " GROUP BY c.id "
+
+    if sort == "newest":
+        q += " ORDER BY datetime(c.created_at) DESC NULLS LAST, c.title COLLATE NOCASE ASC"
+    elif sort == "oldest":
+        q += " ORDER BY datetime(c.created_at) ASC NULLS LAST, c.title COLLATE NOCASE ASC"
+    else:
+        q += " ORDER BY c.title COLLATE NOCASE ASC"
+
+    rows = conn.execute(q, params).fetchall()
+    conn.close()
+    result = []
+    for row in rows:
+        result.append(
+            {
+                "id": row[0],
+                "title": row[1],
+                "created_at": row[2],
+                "model": row[3],
+                "categories": row[4],
+                "content_analysis": row[5] or "",
+                "content_preview": row[6] or "",
+                "content_len": int(row[7] or 0),
+            }
+        )
+    return result
+
+
 def get_chat(chat_id: str):
     conn = get_conn()
     row = conn.execute(
@@ -140,6 +235,21 @@ def get_chat(chat_id: str):
     if not row:
         return None
     return {"id": row[0], "title": row[1], "created_at": row[2], "model": row[3], "content": row[4]}
+
+
+def get_chats(chat_ids: List[str]) -> List[Dict[str, Any]]:
+    if not chat_ids:
+        return []
+    conn = get_conn()
+    qmarks = ",".join(["?"] * len(chat_ids))
+    rows = conn.execute(
+        f"SELECT id, title, created_at, model, content FROM chats WHERE id IN ({qmarks})",
+        chat_ids,
+    ).fetchall()
+    conn.close()
+    out = [{"id": r[0], "title": r[1], "created_at": r[2], "model": r[3], "content": r[4]} for r in rows]
+    by_id = {c["id"]: c for c in out}
+    return [by_id[cid] for cid in chat_ids if cid in by_id]
 
 
 def list_categories() -> List[Dict[str, Any]]:
@@ -335,51 +445,133 @@ def _chat_row(chat: Dict[str, Any], key_prefix: str, analyzed_pool: List[Dict[st
             st.caption("—")
     with cols[3]:
         with st.expander("Preview"):
-            details = get_chat(chat["id"])
             st.text_area(
                 "Content",
-                details.get("content") if details else "",
+                (chat.get("content_preview") or ""),
                 height=160,
                 label_visibility="collapsed",
             )
-            if details:
-                # "You've explored this before" (deterministic matching)
-                target = analyze_chat(details)
-                target["id"] = details.get("id")
-                target["title"] = details.get("title")
-                target["created_at"] = details.get("created_at")
-                similars = find_similar_conversations(target, analyzed_pool, top_k=3)
-                if similars:
-                    st.markdown("#### You’ve explored this before")
-                    for s in similars:
-                        st.markdown(f"**{s['title']}**")
-                        if s.get("created_at"):
-                            st.caption(s["created_at"])
-                        if s.get("overlap_topics"):
-                            st.write("Overlapping topics: " + ", ".join(s["overlap_topics"]))
-                        if s.get("overlap_keywords"):
-                            st.write("Overlapping keywords: " + ", ".join([f"`{k}`" for k in s["overlap_keywords"]]))
+            if chat.get("content_len", 0) > len(chat.get("content_preview") or ""):
+                st.caption(f"Preview truncated ({len(chat.get('content_preview') or ''):,} / {chat.get('content_len', 0):,} chars).")
+            # Similar conversations are expensive: compute only when preview is opened.
+            similars = _cached_similar_conversations(
+                chat_id=chat["id"],
+                title=chat.get("title") or "",
+                created_at=chat.get("created_at"),
+                model=chat.get("model") or "",
+                content_analysis=chat.get("content_analysis") or "",
+                analyzed_pool=analyzed_pool,
+            )
+            if similars:
+                st.markdown("#### You’ve explored this before")
+                for s in similars:
+                    st.markdown(f"**{s['title']}**")
+                    if s.get("created_at"):
+                        st.caption(s["created_at"])
+                    if s.get("overlap_topics"):
+                        st.write("Overlapping topics: " + ", ".join(s["overlap_topics"]))
+                    if s.get("overlap_keywords"):
+                        st.write("Overlapping keywords: " + ", ".join([f"`{k}`" for k in s["overlap_keywords"]]))
     return checked
+
+
+@st.cache_data(show_spinner=False)
+def _cached_analyze_chat(chat_id: str, title: str, created_at: Optional[str], model: str, content_analysis: str):
+    # Deterministic per-chat analysis (content already truncated upstream).
+    details = {"id": chat_id, "title": title, "created_at": created_at, "model": model, "content": content_analysis}
+    return analyze_chat(details)
+
+
+def _pool_signature(analyzed_pool: List[Dict[str, Any]]) -> str:
+    # Keep signature stable but cheap: ids + topics/keywords only.
+    minimal = []
+    for a in analyzed_pool:
+        minimal.append(
+            {
+                "id": a.get("id"),
+                "topics": a.get("topics") or [],
+                "keywords": a.get("keywords") or [],
+            }
+        )
+    payload = json.dumps(minimal, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+
+@st.cache_data(show_spinner=False)
+def _cached_similars(chat_id: str, pool_sig: str, target: Dict[str, Any], pool_minimal: List[Dict[str, Any]]):
+    # Cache per chat + pool signature (pool changes with search/filter).
+    _ = pool_sig
+    return find_similar_conversations(target, pool_minimal, top_k=3)
+
+
+def _cached_similar_conversations(
+    *,
+    chat_id: str,
+    title: str,
+    created_at: Optional[str],
+    model: str,
+    content_analysis: str,
+    analyzed_pool: List[Dict[str, Any]],
+):
+    target = _cached_analyze_chat(chat_id, title, created_at, model, content_analysis)
+    target = dict(target)
+    target["id"] = chat_id
+    target["title"] = title
+    target["created_at"] = created_at
+    pool_sig = _pool_signature(analyzed_pool)
+    pool_min = []
+    for a in analyzed_pool:
+        pool_min.append(
+            {
+                "id": a.get("id"),
+                "title": a.get("title"),
+                "created_at": a.get("created_at"),
+                "topics": a.get("topics") or [],
+                "keywords": a.get("keywords") or [],
+            }
+        )
+    return _cached_similars(chat_id, pool_sig, target, pool_min)
+
+
+@st.cache_data(show_spinner=False)
+def _cached_global_insights(analyzed_min: List[Dict[str, Any]]):
+    return generate_global_insights(analyzed_min)
+
+
+@st.cache_data(show_spinner=False)
+def _cached_message_patterns(msg_df: pd.DataFrame, speaker_filter: str, min_len: int):
+    return analyze_message_patterns(msg_df, speaker_filter=speaker_filter, min_len=min_len)
 
 
 def main(go_home: Callable[[], None] | None = None):
     # Header + Back button
     top_left, top_right = st.columns([0.8, 0.2])
     with top_left:
-        st.title("📁 InboxGPT")
+        st.title("📁 Prompt Scope")
         st.caption("Import ChatGPT exports, categorize conversations, and export back — local-only.")
     with top_right:
         if go_home is not None:
             if st.button("← Back to Home", use_container_width=True):
                 go_home()
 
-    init_db()
-
     with st.sidebar:
         st.subheader("Import / Export")
+        # Ensure DB exists before any reads/writes.
+        init_db()
+
+        with st.expander("Debug (temporary)", expanded=False):
+            st.write(
+                {
+                    "app_file": str(Path(__file__).resolve()),
+                    "app_dir": str(APP_DIR),
+                    "db_path": DB_PATH,
+                    "db_exists": Path(DB_PATH).exists(),
+                    "db_chat_count": count_chats(),
+                }
+            )
 
         file = st.file_uploader(
-            "Import chat JSON (raw export / conversations.json / previously categorized)",
+            "Import new chat JSON (optional; stored in SQLite for future sessions)",
             type=["json"],
             accept_multiple_files=False,
         )
@@ -429,28 +621,43 @@ def main(go_home: Callable[[], None] | None = None):
             help="How many conversations to show per page.",
         )
 
-    chats = list_chats(
+    chats = list_chats_with_content(
         search=search,
         category_ids=cat_filter_ids,
         sort={"newest": "newest", "oldest": "oldest", "title A→Z": "title"}[sort],
     )
 
-    analyzed = []
+    if not chats:
+        st.info(
+            "Your SQLite database is empty. Use the sidebar **Import** to upload your ChatGPT export JSON "
+            "(e.g. `conversations.json`). Imported chats will persist locally and be available next time."
+        )
+
+    t0 = time.perf_counter()
+    analyzed: List[Dict[str, Any]] = []
+    analyzed_n = 0
     for c in chats:
-        full = get_chat(c["id"])
-        if not full:
-            continue
-        row = analyze_chat(full)
-        row["id"] = full.get("id")
-        row["title"] = full.get("title")
-        row["created_at"] = full.get("created_at")
+        analyzed_n += 1
+        row = _cached_analyze_chat(
+            c["id"],
+            c.get("title") or "",
+            c.get("created_at"),
+            c.get("model") or "",
+            c.get("content_analysis") or "",
+        )
+        row = dict(row)
+        row["id"] = c.get("id")
+        row["title"] = c.get("title")
+        row["created_at"] = c.get("created_at")
         analyzed.append(row)
+    analysis_s = time.perf_counter() - t0
 
     tab_insights, tab_patterns = st.tabs(["Insights", "Patterns"])
 
     with tab_insights:
         st.subheader("Insights")
-        insights = generate_global_insights(analyzed)
+        # Deterministic + potentially expensive; cache.
+        insights = _cached_global_insights(analyzed)
         for insight in insights:
             desc = insight.get("description") or ""
             n_lines = desc.count("\n") + 1 if desc else 0
@@ -464,7 +671,7 @@ def main(go_home: Callable[[], None] | None = None):
 
     with tab_patterns:
         st.subheader("Patterns")
-        st.caption("Message-level patterns based on conversations in your InboxGPT database.")
+        st.caption("Message-level patterns based on conversations in your Prompt Scope database.")
 
         p1, p2, p3 = st.columns([0.35, 0.35, 0.3])
         with p1:
@@ -485,13 +692,20 @@ def main(go_home: Callable[[], None] | None = None):
             msg_search = st.text_input("Search messages", key="patterns_search_messages")
 
         # Build message-level rows from the currently loaded chat set (filtered by search/category).
-        full_chats: List[Dict[str, Any]] = []
-        for c in chats:
-            full = get_chat(c["id"])
-            if full:
-                full_chats.append(full)
-
-        msg_df = messages_from_stored_chats(full_chats, source_name="SQLite")
+        # Use the already-loaded (truncated) chat content instead of re-querying per chat.
+        msg_df = messages_from_stored_chats(
+            [
+                {
+                    "id": c.get("id"),
+                    "title": c.get("title"),
+                    "created_at": c.get("created_at"),
+                    "model": c.get("model"),
+                    "content": c.get("content_analysis") or "",
+                }
+                for c in chats
+            ],
+            source_name="SQLite",
+        )
 
         # Optional fallback: allow ad-hoc raw export analysis without affecting DB.
         with st.expander("Optional: analyze raw `conversations.json` mapping exports (not imported)"):
@@ -518,7 +732,7 @@ def main(go_home: Callable[[], None] | None = None):
             if msg_search:
                 msg_df = msg_df[msg_df["text"].astype(str).str.contains(msg_search, case=False, na=False)]
 
-            analysis = analyze_message_patterns(msg_df, speaker_filter=speaker_filter, min_len=min_len)
+            analysis = _cached_message_patterns(msg_df, speaker_filter=speaker_filter, min_len=min_len)
             working = analysis["working"]
 
             total_messages = len(working)
@@ -594,7 +808,7 @@ def main(go_home: Callable[[], None] | None = None):
             st.download_button(
                 "Download parsed messages as CSV",
                 data=csv_data,
-                file_name="inboxgpt_message_patterns.csv",
+                file_name="prompt_scope_message_patterns.csv",
                 mime="text/csv",
             )
 
@@ -636,12 +850,11 @@ def main(go_home: Callable[[], None] | None = None):
 
     if selected_ids:
         combined_parts: List[str] = []
-        for cid in selected_ids:
-            ch = get_chat(cid)
-            if ch:
-                combined_parts.append(f"{ch.get('title') or ''}\n{ch.get('content') or ''}")
+        for ch in get_chats(selected_ids):
+            combined_parts.append(f"{ch.get('title') or ''}\n{(ch.get('content') or '')[:MAX_ANALYSIS_CHARS]}")
         combined_text = "\n\n".join(combined_parts)
-        suggested, _scores = guess_topics(combined_text)
+        # Deterministic but can be expensive; cache by content (already bounded by selected + truncation).
+        suggested, _scores = _cached_guess_topics(combined_text[:MAX_ANALYSIS_CHARS])
         if suggested:
             st.markdown("### Suggested tags")
             st.caption("Based on the selected chats’ topics (deterministic rules).")
@@ -649,7 +862,7 @@ def main(go_home: Callable[[], None] | None = None):
                 "Suggested tags",
                 options=suggested,
                 default=suggested,
-                key="inboxgpt_suggested_tags",
+                key="prompt_scope_suggested_tags",
             )
 
     cat_left, cat_right = st.columns([0.6, 0.4])
@@ -662,7 +875,7 @@ def main(go_home: Callable[[], None] | None = None):
             if new_cat.strip():
                 names.append(new_cat.strip())
             names += assign_existing
-            suggested_selected = st.session_state.get("inboxgpt_suggested_tags") or []
+            suggested_selected = st.session_state.get("prompt_scope_suggested_tags") or []
             names += list(suggested_selected)
             names = [n.strip() for n in names if n and n.strip()]
             names = list(dict.fromkeys(names))  # stable de-dupe
@@ -684,6 +897,24 @@ def main(go_home: Callable[[], None] | None = None):
     for i, cat in enumerate(cats):
         with cols[i % 4]:
             st.metric(cat["name"], f"{cat['count']} chats")
+
+    with st.expander("Performance / debug", expanded=False):
+        st.caption("Lightweight timing for reruns. Values exclude Streamlit rendering time.")
+        st.write(
+            {
+                "chats_loaded": len(chats),
+                "chats_analyzed": analyzed_n,
+                "analysis_seconds": round(analysis_s, 3),
+                "analysis_chars_per_chat": MAX_ANALYSIS_CHARS,
+                "preview_chars_per_chat": MAX_PREVIEW_CHARS,
+                "cache_note": "Deterministic analysis is cached via st.cache_data; changes in DB/content invalidate cache automatically.",
+            }
+        )
+
+
+@st.cache_data(show_spinner=False)
+def _cached_guess_topics(text: str):
+    return guess_topics(text)
 
 
 if __name__ == "__main__":
