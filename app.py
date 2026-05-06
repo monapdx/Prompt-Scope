@@ -1057,10 +1057,13 @@ def main(go_home: Callable[[], None] | None = None):
     header[2].markdown("**Categories**")
     header[3].markdown("**Preview**")
 
-    selected_ids = []
+    selected_ids: List[str] = []
+    selected_checkbox_keys: List[str] = []
     for idx, chat in enumerate(visible):
+        checkbox_key = f"row{start+idx}_{chat['id']}"
         if _chat_row(chat, key_prefix=f"row{start+idx}"):
             selected_ids.append(chat["id"])
+            selected_checkbox_keys.append(checkbox_key)
 
     st.markdown("---")
     st.markdown("### Categorize Selected")
@@ -1102,6 +1105,10 @@ def main(go_home: Callable[[], None] | None = None):
             names = list(dict.fromkeys(names))  # stable de-dupe
             assign_categories(selected_ids, names)
             st.success(f"Assigned {', '.join(names)} to {len(selected_ids)} chat(s).")
+            # Reset selection after successful assignment.
+            for key in selected_checkbox_keys:
+                st.session_state[key] = False
+            st.session_state.preview_chat_id = None
             st.rerun()
 
     with cat_right:
@@ -1110,6 +1117,10 @@ def main(go_home: Callable[[], None] | None = None):
         if st.button("Remove from selected"):
             remove_categories(selected_ids, remove_existing)
             st.warning(f"Removed {', '.join(remove_existing)} from {len(selected_ids)} chat(s).")
+            # Reset selection after successful removal.
+            for key in selected_checkbox_keys:
+                st.session_state[key] = False
+            st.session_state.preview_chat_id = None
             st.rerun()
 
     st.markdown("### Category Summary")
