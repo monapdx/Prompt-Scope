@@ -150,6 +150,41 @@ STOPWORDS = {
 TOKEN_RE = re.compile(r"[a-zA-Z][a-zA-Z'-]+")
 
 
+def remove_code(text: str) -> str:
+    """
+    Remove common code formatting so token analysis reflects natural language.
+
+    - Strips triple-backtick fenced blocks: ``` ... ```
+    - Strips inline code spans: `...`
+    """
+    if not text:
+        return ""
+    s = str(text)
+    # Triple-backtick blocks (including optional language).
+    s = re.sub(r"```[\s\S]*?```", " ", s)
+    # Inline backticks.
+    s = re.sub(r"`[^`]*`", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def is_code_token(token: str) -> bool:
+    """
+    Heuristic: identify tokens that are more likely code-ish than natural language.
+    """
+    if not token:
+        return False
+    t = token.strip().lower()
+    if "_" in t:
+        return True
+    if any(ch.isdigit() for ch in t):
+        return True
+    if len(t) > 20:
+        return True
+    if t.startswith(("def", "class", "return", "import")):
+        return True
+    return False
+
+
 def tokenize(text: str, min_len: int = 3, drop_stopwords: bool = True) -> List[str]:
     tokens = [t.lower() for t in TOKEN_RE.findall(text or "")]
     tokens = [t for t in tokens if len(t) >= min_len]
@@ -379,7 +414,13 @@ def messages_from_stored_chats(chats: List[Dict[str, Any]], source_name: str = "
     return pd.DataFrame(rows)
 
 
-def analyze_message_patterns(df: pd.DataFrame, speaker_filter: str = "all", min_len: int = 3) -> Dict[str, pd.DataFrame]:
+def analyze_message_patterns(
+    df: pd.DataFrame,
+    speaker_filter: str = "all",
+    min_len: int = 3,
+    *,
+    exclude_code: bool = True,
+) -> Dict[str, pd.DataFrame]:
     """
     Compute deterministic message-level pattern tables.
     Returns:
@@ -409,7 +450,12 @@ def analyze_message_patterns(df: pd.DataFrame, speaker_filter: str = "all", min_
     monthly_counter: Counter = Counter()
 
     for _, row in working.iterrows():
-        tokens = tokenize(str(row.get("text") or ""), min_len=min_len, drop_stopwords=True)
+        text = str(row.get("text") or "")
+        if exclude_code:
+            text = remove_code(text)
+        tokens = tokenize(text, min_len=min_len, drop_stopwords=True)
+        if exclude_code:
+            tokens = [t for t in tokens if not is_code_token(t)]
         token_counter.update(tokens)
         bigram_counter.update(build_ngrams(tokens, 2))
         trigram_counter.update(build_ngrams(tokens, 3))

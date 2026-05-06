@@ -708,8 +708,8 @@ def _cached_global_insights(analyzed_min: List[Dict[str, Any]]):
 
 
 @st.cache_data(show_spinner=False)
-def _cached_message_patterns(msg_df: pd.DataFrame, speaker_filter: str, min_len: int):
-    return analyze_message_patterns(msg_df, speaker_filter=speaker_filter, min_len=min_len)
+def _cached_message_patterns(msg_df: pd.DataFrame, speaker_filter: str, min_len: int, exclude_code: bool):
+    return analyze_message_patterns(msg_df, speaker_filter=speaker_filter, min_len=min_len, exclude_code=exclude_code)
 
 
 def main(go_home: Callable[[], None] | None = None):
@@ -877,6 +877,13 @@ def main(go_home: Callable[[], None] | None = None):
         with p3:
             msg_search = st.text_input("Search messages", key="patterns_search_messages")
 
+        exclude_code = st.checkbox(
+            "Exclude code from analysis",
+            value=True,
+            key="patterns_exclude_code",
+            help="When enabled, removes backtick code blocks/inline code and filters code-ish tokens from word/phrase stats.",
+        )
+
         if st.button("Run patterns on current filter", key="run_patterns_btn"):
             # Fetch from SQLite (source of truth), then expand each chat into message rows.
             chats_full = list_chats_with_content(
@@ -939,7 +946,9 @@ def main(go_home: Callable[[], None] | None = None):
             df_for_tokens = msg_df.copy()
             if speaker_filter == "all":
                 df_for_tokens = df_for_tokens[df_for_tokens["author_role"].isin(["user", "assistant"])]
-            analysis = _cached_message_patterns(df_for_tokens, speaker_filter=speaker_filter, min_len=min_len)
+            analysis = _cached_message_patterns(
+                df_for_tokens, speaker_filter=speaker_filter, min_len=min_len, exclude_code=exclude_code
+            )
             working = analysis["working"]
 
             # Metrics must reflect actual parsed message rows (not conversations).
