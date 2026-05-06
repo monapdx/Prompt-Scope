@@ -1,0 +1,92 @@
+# -----------------------
+# Python
+# -----------------------
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# -----------------------
+# Environment variables
+# -----------------------
+.env
+.env.*
+!.env.example
+
+# -----------------------
+# SQLite / local databases
+# -----------------------
+*.db
+*.sqlite
+*.sqlite3
+
+# -----------------------
+# Streamlit
+# -----------------------
+.streamlit/secrets.toml
+
+# -----------------------
+# OS files
+# -----------------------
+.DS_Store
+Thumbs.db
+
+# -----------------------
+# Logs
+# -----------------------
+*.log
+
+# -----------------------
+# Testing / coverage
+# -----------------------
+.pytest_cache/
+.coverage
+htmlcov/
+
+# -----------------------
+# Build / packaging
+# -----------------------
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# -----------------------
+# IDE / Editor
+# -----------------------
+.vscode/
+.idea/
+
+# -----------------------
+# Jupyter (if used)
+# -----------------------
+.ipynb_checkpoints/
+
+# -----------------------
+# Your project-specific (IMPORTANT)
+# -----------------------
+
+# Input data (user files)
+input/
+uploads/
+
+# Generated outputs / exports
+output/
+workspaces/
+exports/
+*.csv
+*.json
+
+# Cached analysis artifacts
+cache/
+tmp/
+
+# -----------------------
+# Optional: allow sample data
+# -----------------------
+!sample_data/
