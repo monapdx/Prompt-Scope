@@ -6,6 +6,7 @@ import json
 import sqlite3
 import sys
 import time
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -25,7 +26,7 @@ if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
 
 from conversation_insights import analyze_chat, generate_global_insights, guess_topics
-from chat_patterns import analyze_message_patterns, messages_from_stored_chats, parse_mapping_export_bytes
+from chat_patterns import analyze_message_patterns, parse_mapping_export_bytes
 
 # Store the DB alongside this app file (local-first, predictable).
 DB_PATH = str((APP_DIR / "promptscope.db").resolve())
@@ -33,6 +34,243 @@ DB_PATH = str((APP_DIR / "promptscope.db").resolve())
 # ---------- PERF LIMITS ----------
 MAX_ANALYSIS_CHARS = 20_000
 MAX_PREVIEW_CHARS = 4_000
+
+_PATTERNS_JSON_NOISE_TERMS = {
+    "null",
+    "type",
+    "content",
+    "parts",
+    "message",
+    "mapping",
+    "author",
+    "metadata",
+    "children",
+    "parent",
+    "create_time",
+    "update_time",
+    "conversation_id",
+    "recipient",
+    "status",
+    "finished_successfully",
+}
+
+_ROLE_LINE_RE = re.compile(r"^\s*\[(user|assistant|system|tool)\]\s*", re.I)
+
+
+def _clean_text_for_token_analysis(text: str) -> str:
+    """
+    Remove common JSON-structural noise terms so word/phrase stats reflect user content.
+    Keeps display text separate (we store raw in `text_raw`).
+    """
+    if not text:
+        return ""
+    cleaned = str(text)
+    for term in _PATTERNS_JSON_NOISE_TERMS:
+        cleaned = re.sub(rf"\b{re.escape(term)}\b", " ", cleaned, flags=re.I)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+def _normalize_role(value: Any) -> str:
+    v = (str(value or "").strip().lower()) if value is not None else ""
+    if "assistant" in v or v == "gpt":
+        return "assistant"
+    if "user" in v or "human" in v:
+        return "user"
+    if "system" in v:
+        return "system"
+    if "tool" in v:
+        return "tool"
+    return v or "unknown"
+
+
+def _flatten_text_parts(part: Any) -> str:
+    if isinstance(part, str):
+        return part
+    if isinstance(part, dict):
+        if "text" in part and isinstance(part["text"], str):
+            return part["text"]
+        if "content" in part and isinstance(part["content"], str):
+            return part["content"]
+        if "result" in part and isinstance(part["result"], str):
+            return part["result"]
+        if "parts" in part and isinstance(part["parts"], list):
+            return " ".join(_flatten_text_parts(p) for p in part["parts"])
+        return ""
+    if isinstance(part, list):
+        return " ".join(_flatten_text_parts(p) for p in part)
+    return ""
+
+
+def _extract_message_text(message: Dict[str, Any]) -> str:
+    content = message.get("content")
+    if isinstance(content, dict):
+        if "parts" in content:
+            return _flatten_text_parts(content.get("parts")).strip()
+        for k in ("text", "result", "content"):
+            v = content.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        flattened = _flatten_text_parts(content)
+        if flattened.strip():
+            return flattened.strip()
+    v = message.get("text")
+    if isinstance(v, str) and v.strip():
+        return v.strip()
+    if isinstance(content, str) and content.strip():
+        return content.strip()
+    if content is not None:
+        flattened = _flatten_text_parts(content)
+        if flattened.strip():
+            return flattened.strip()
+    return ""
+
+
+def _extract_author_role(message: Dict[str, Any], node: Dict[str, Any] | None = None) -> str:
+    author = message.get("author") or {}
+    raw = (author.get("role") or author.get("name") or "").strip()
+    if not raw:
+        meta = message.get("metadata") or {}
+        raw = (meta.get("author_role") or meta.get("role") or "").strip()
+    if not raw and node:
+        raw = ((node.get("author") or {}).get("role") or "").strip()
+    return _normalize_role(raw)
+
+
+def _split_transcript_with_role_markers(content: str) -> List[Dict[str, Any]]:
+    if not content:
+        return []
+    lines = content.splitlines()
+    current_role: Optional[str] = None
+    buf: List[str] = []
+    out: List[Dict[str, Any]] = []
+
+    def flush():
+        nonlocal current_role, buf
+        if current_role and buf:
+            text = "\n".join(buf).strip()
+            if text:
+                out.append({"author_role": current_role, "text": text})
+        buf = []
+
+    for line in lines:
+        m = _ROLE_LINE_RE.match(line)
+        if m:
+            flush()
+            current_role = m.group(1).strip().lower()
+            remainder = _ROLE_LINE_RE.sub("", line).strip()
+            if remainder:
+                buf.append(remainder)
+            continue
+        buf.append(line)
+    flush()
+    return out
+
+
+def extract_messages_from_chat_content(chat: dict) -> list[dict]:
+    """
+    Parse a stored chat row into message rows.
+
+    Handles:
+    - Transcript text with `[user] ...` / `[assistant] ...` markers
+    - JSON string containing ChatGPT export objects
+    - mapping-node exports (ChatGPT `conversations.json` shape)
+    - `messages`, `turns`, or `conversation` lists
+    """
+    cid = chat.get("id") or chat.get("conversation_id") or ""
+    title = chat.get("title") or "(untitled)"
+    created_at = chat.get("created_at")
+    raw_content = chat.get("content") or ""
+
+    rows: List[Dict[str, Any]] = []
+
+    def add_row(role: str, text: str, ts: Any = None, msg_id: str | None = None):
+        text = (text or "").strip()
+        if not text:
+            return
+        role_n = _normalize_role(role)
+        ts_val = ts if ts is not None else created_at
+        rows.append(
+            {
+                "conversation_id": cid,
+                "conversation_title": title,
+                "author_role": role_n,
+                "created_at": ts_val,
+                "text_raw": text,
+                "text": _clean_text_for_token_analysis(text),
+                "word_count": len(text.split()),
+                "char_count": len(text),
+                "message_id": msg_id or "",
+            }
+        )
+
+    # 1) If it looks like a transcript with role markers, parse that first.
+    transcript_parts = _split_transcript_with_role_markers(str(raw_content))
+    if transcript_parts:
+        for idx, p in enumerate(transcript_parts):
+            add_row(p.get("author_role") or "unknown", p.get("text") or "", created_at, msg_id=f"{cid}:{idx}")
+        # If we got real roles, return immediately.
+        if any(r["author_role"] in ("user", "assistant", "system", "tool") for r in rows):
+            return rows
+        # Otherwise we still fall through to try structured JSON.
+
+    # 2) Try JSON parse if content is JSON-ish
+    obj: Any = None
+    s = str(raw_content).strip()
+    if (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]")):
+        try:
+            obj = json.loads(s)
+        except Exception:
+            obj = None
+
+    # If JSON parsed, attempt multiple shapes.
+    if obj is not None:
+        conv = obj
+        # Sometimes content is a list with a single conversation.
+        if isinstance(obj, list) and obj:
+            # pick the first plausible dict
+            conv = obj[0] if isinstance(obj[0], dict) else obj
+
+        if isinstance(conv, dict):
+            # mapping shape
+            mapping = conv.get("mapping")
+            if isinstance(mapping, dict) and mapping:
+                for node_id, node in mapping.items():
+                    message = (node or {}).get("message")
+                    if not isinstance(message, dict):
+                        continue
+                    text = _extract_message_text(message)
+                    if not text:
+                        continue
+                    role = _extract_author_role(message, node)
+                    ts = message.get("create_time") or message.get("created_at") or created_at
+                    add_row(role, text, ts, msg_id=message.get("id") or node_id)
+                if rows:
+                    return rows
+
+            # messages / turns / conversation list shapes
+            for k in ("messages", "turns", "conversation"):
+                seq = conv.get(k)
+                if isinstance(seq, list) and seq:
+                    for idx, m in enumerate(seq):
+                        if isinstance(m, dict):
+                            role = _normalize_role(m.get("role") or m.get("author_role") or (m.get("author") or {}).get("role"))
+                            text = m.get("content") or m.get("text") or ""
+                            if isinstance(text, (dict, list)):
+                                # ChatGPT export message objects
+                                text = _extract_message_text(m)
+                            ts = m.get("create_time") or m.get("created_at") or created_at
+                            add_row(role, str(text), ts, msg_id=str(m.get("id") or f"{cid}:{idx}"))
+                        else:
+                            add_row("unknown", str(m), created_at, msg_id=f"{cid}:{idx}")
+                    if rows:
+                        return rows
+
+    # 3) Final fallback: do not treat entire conversation as one message unless we have no structure.
+    text_fallback = s if isinstance(raw_content, str) else str(raw_content)
+    if text_fallback.strip():
+        add_row("unknown", text_fallback.strip(), created_at, msg_id=f"{cid}:fallback")
+    return rows
 
 # ---------- DB LAYER ----------
 
@@ -638,24 +876,30 @@ def main(go_home: Callable[[], None] | None = None):
             msg_search = st.text_input("Search messages", key="patterns_search_messages")
 
         if st.button("Run patterns on current filter", key="run_patterns_btn"):
+            # Fetch from SQLite (source of truth), then expand each chat into message rows.
             chats_full = list_chats_with_content(
                 search=search,
                 category_ids=cat_filter_ids,
                 sort={"newest": "newest", "oldest": "oldest", "title A→Z": "title"}[sort],
+                analysis_chars=MAX_ANALYSIS_CHARS,
+                preview_chars=MAX_PREVIEW_CHARS,
             )
-            msg_df = messages_from_stored_chats(
-                [
-                    {
-                        "id": c.get("id"),
-                        "title": c.get("title"),
-                        "created_at": c.get("created_at"),
-                        "model": c.get("model"),
-                        "content": c.get("content_analysis") or "",
-                    }
-                    for c in chats_full
-                ],
-                source_name="SQLite",
-            )
+            rows: List[Dict[str, Any]] = []
+            for c in chats_full:
+                chat_obj = {
+                    "id": c.get("id"),
+                    "title": c.get("title"),
+                    "created_at": c.get("created_at"),
+                    # Use analysis text (bounded) for parsing; preview/full is loaded only on demand elsewhere.
+                    "content": c.get("content_analysis") or "",
+                }
+                rows.extend(extract_messages_from_chat_content(chat_obj))
+
+            msg_df = pd.DataFrame(rows)
+            if not msg_df.empty:
+                # Normalize timestamps if possible.
+                msg_df["created_at"] = pd.to_datetime(msg_df.get("created_at"), errors="coerce")
+                msg_df["source_file"] = "SQLite"
             st.session_state._patterns_msg_df = msg_df
             st.session_state._patterns_filter = {"speaker_filter": speaker_filter, "min_len": min_len}
 
@@ -687,15 +931,20 @@ def main(go_home: Callable[[], None] | None = None):
             st.info("No message-level data found for the current view. Try importing a richer export or using the optional mapping parser above.")
         else:
             if msg_search:
-                msg_df = msg_df[msg_df["text"].astype(str).str.contains(msg_search, case=False, na=False)]
+                msg_df = msg_df[msg_df["text_raw"].astype(str).str.contains(msg_search, case=False, na=False)]
 
-            analysis = _cached_message_patterns(msg_df, speaker_filter=speaker_filter, min_len=min_len)
+            # Avoid letting unknown/structural rows contaminate token stats by default.
+            df_for_tokens = msg_df.copy()
+            if speaker_filter == "all":
+                df_for_tokens = df_for_tokens[df_for_tokens["author_role"].isin(["user", "assistant"])]
+            analysis = _cached_message_patterns(df_for_tokens, speaker_filter=speaker_filter, min_len=min_len)
             working = analysis["working"]
 
-            total_messages = len(working)
-            total_words = int(working["word_count"].sum()) if "word_count" in working else 0
-            total_conversations = int(working["conversation_id"].nunique()) if "conversation_id" in working else 0
-            total_files = int(working["source_file"].nunique()) if "source_file" in working else 0
+            # Metrics must reflect actual parsed message rows (not conversations).
+            total_messages = int(len(msg_df))
+            total_words = int(msg_df["word_count"].sum()) if "word_count" in msg_df else 0
+            total_conversations = int(msg_df["conversation_id"].nunique()) if "conversation_id" in msg_df else 0
+            total_files = int(msg_df["source_file"].nunique()) if "source_file" in msg_df else 0
 
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("Messages", f"{total_messages:,}")
@@ -704,10 +953,11 @@ def main(go_home: Callable[[], None] | None = None):
             m4.metric("Files", f"{total_files:,}")
 
             st.subheader("You vs Assistant")
-            user_messages = int((working["author_role"] == "user").sum())
-            assistant_messages = int((working["author_role"] == "assistant").sum())
-            user_words = int(working.loc[working["author_role"] == "user", "word_count"].sum()) if total_words else 0
-            assistant_words = int(working.loc[working["author_role"] == "assistant", "word_count"].sum()) if total_words else 0
+            # Unknown rows should not contaminate these metrics.
+            user_messages = int((msg_df["author_role"] == "user").sum())
+            assistant_messages = int((msg_df["author_role"] == "assistant").sum())
+            user_words = int(msg_df.loc[msg_df["author_role"] == "user", "word_count"].sum()) if total_words else 0
+            assistant_words = int(msg_df.loc[msg_df["author_role"] == "assistant", "word_count"].sum()) if total_words else 0
 
             user_message_pct = (user_messages / total_messages * 100) if total_messages else 0
             assistant_message_pct = (assistant_messages / total_messages * 100) if total_messages else 0
@@ -754,20 +1004,30 @@ def main(go_home: Callable[[], None] | None = None):
                 st.dataframe(analysis["conversations"], use_container_width=True, height=520)
 
             with t5:
-                display_cols = ["source_file", "conversation_title", "author_role", "created_at", "word_count", "text"]
+                display_cols = ["source_file", "conversation_title", "author_role", "created_at", "word_count", "text_raw"]
                 st.dataframe(
-                    working.sort_values("created_at", na_position="last")[display_cols],
+                    msg_df.sort_values("created_at", na_position="last")[display_cols],
                     use_container_width=True,
                     height=650,
                 )
 
-            csv_data = working.to_csv(index=False).encode("utf-8")
+            csv_data = msg_df.to_csv(index=False).encode("utf-8")
             st.download_button(
                 "Download parsed messages as CSV",
                 data=csv_data,
                 file_name="prompt_scope_message_patterns.csv",
                 mime="text/csv",
             )
+
+            with st.expander("Patterns debug", expanded=False):
+                st.caption("Helps verify message parsing quality from stored SQLite chats.")
+                st.write({"author_role_counts": msg_df["author_role"].value_counts(dropna=False).to_dict()})
+                fallback_unknown = int((msg_df["author_role"] == "unknown").sum())
+                st.write({"fallback_unknown_rows": fallback_unknown})
+                sample_cols = ["conversation_title", "author_role", "created_at", "text_raw"]
+                sample = msg_df[sample_cols].head(20).copy()
+                sample["text_raw"] = sample["text_raw"].astype(str).str.slice(0, 160)
+                st.dataframe(sample, use_container_width=True, height=360)
 
     total = len(chats)
     if "page" not in st.session_state:
