@@ -184,12 +184,34 @@ def extract_messages_from_chat_content(chat: dict) -> list[dict]:
 
     rows: List[Dict[str, Any]] = []
 
+    def _coerce_row_timestamp(ts: Any, parent_ts: Any) -> Any:
+        """
+        Prefer message-level timestamps, else fall back to the parent chat timestamp.
+        Returns a value suitable for `pd.to_datetime(..., errors="coerce")`.
+
+        Handles common ChatGPT export epoch seconds/milliseconds.
+        """
+        v = ts if ts is not None and ts != "" else parent_ts
+        if v is None:
+            return None
+        # If numeric, interpret as epoch seconds (or ms) and convert to ISO.
+        if isinstance(v, (int, float)):
+            try:
+                fv = float(v)
+                # Heuristic: >1e12 is definitely ms; >1e10 likely ms; else seconds.
+                if fv > 1e12 or fv > 1e10:
+                    fv = fv / 1000.0
+                return datetime.utcfromtimestamp(fv).isoformat() + "Z"
+            except Exception:
+                return parent_ts
+        return v
+
     def add_row(role: str, text: str, ts: Any = None, msg_id: str | None = None):
         text = (text or "").strip()
         if not text:
             return
         role_n = _normalize_role(role)
-        ts_val = ts if ts is not None else created_at
+        ts_val = _coerce_row_timestamp(ts, created_at)
         rows.append(
             {
                 "conversation_id": cid,
@@ -1035,6 +1057,27 @@ def main(go_home: Callable[[], None] | None = None):
                 st.write({"author_role_counts": msg_df["author_role"].value_counts(dropna=False).to_dict()})
                 fallback_unknown = int((msg_df["author_role"] == "unknown").sum())
                 st.write({"fallback_unknown_rows": fallback_unknown})
+                total_rows = int(len(msg_df))
+                valid_ts = (
+                    int(pd.to_datetime(msg_df["created_at"], errors="coerce").notna().sum())
+                    if "created_at" in msg_df
+                    else 0
+                )
+                missing_ts = total_rows - valid_ts
+                ts_series = (
+                    pd.to_datetime(msg_df["created_at"], errors="coerce") if "created_at" in msg_df else pd.Series([])
+                )
+                earliest = ts_series.min() if len(ts_series) else pd.NaT
+                latest = ts_series.max() if len(ts_series) else pd.NaT
+                st.write(
+                    {
+                        "total_parsed_rows": total_rows,
+                        "rows_with_valid_timestamps": valid_ts,
+                        "rows_missing_timestamps": missing_ts,
+                        "earliest_timestamp": str(earliest) if pd.notna(earliest) else None,
+                        "latest_timestamp": str(latest) if pd.notna(latest) else None,
+                    }
+                )
                 sample_cols = ["conversation_title", "author_role", "created_at", "text_raw"]
                 sample = msg_df[sample_cols].head(20).copy()
                 sample["text_raw"] = sample["text_raw"].astype(str).str.slice(0, 160)
