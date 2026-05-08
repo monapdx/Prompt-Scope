@@ -43,6 +43,8 @@ It turns your chat history into something closer to:
 
 ## 🏗️ How It Works
 
+<img src="https://raw.githubusercontent.com/monapdx/Prompt-Scope/refs/heads/main/diagram.png">
+
 ### 1. Import
 
 Upload your ChatGPT export JSON.
